@@ -3,9 +3,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import MapView from "../components/Map";
 import * as turf from "@turf/turf";
+import type { FeatureCollection, Polygon, MultiPolygon } from "geojson";
 
 type Dest = { name: string; lat: number; lng: number };
-type GeoResult = { name: string; lat: number; lng: number };
 
 type CommunityHit = {
   name: string;
@@ -25,7 +25,7 @@ function toArriveByISO(timeHHMM: string) {
   const HH = String(hh).padStart(2, "0");
   const Min = String(mm).padStart(2, "0");
 
-  // Halifax = Atlantic Time (UTC-4) for MVP
+  // Halifax = Atlantic Time (UTC-4)
   return `${yyyy}-${MM}-${dd}T${HH}:${Min}:00-04:00`;
 }
 
@@ -60,10 +60,10 @@ export default function Home() {
     "public_transport"
   );
 
-  const [isochrone, setIsochrone] = useState<any | null>(null);
+  const [isochrone, setIsochrone] = useState<FeatureCollection | null>(null);
   const [loadingIso, setLoadingIso] = useState(false);
 
-  const [communities, setCommunities] = useState<any | null>(null);
+  const [communities, setCommunities] = useState<FeatureCollection | null>(null);
   const [within, setWithin] = useState<CommunityHit[]>([]);
 
   const arriveByISO = useMemo(() => toArriveByISO(arriveBy), [arriveBy]);
@@ -73,25 +73,25 @@ export default function Home() {
     (async () => {
       try {
         const r = await fetch("/data/hrm_community_boundaries.geojson", { cache: "no-store" });
-        const data = await r.json();
+        const data = (await r.json()) as FeatureCollection;
         setCommunities(data);
 
-        // Debug: log community stats + bbox
-        const fc = data as turf.FeatureCollection;
-        const bbox = turf.bbox(fc);
+        const bbox = turf.bbox(data);
         console.log("🗺️ Communities loaded:", {
-          features: fc.features?.length ?? 0,
+          features: data.features?.length ?? 0,
           bbox: { minLng: bbox[0], minLat: bbox[1], maxLng: bbox[2], maxLat: bbox[3] },
-          sampleProps: fc.features?.[0]?.properties ? Object.keys(fc.features[0].properties) : [],
+          sampleProps: data.features?.[0]?.properties
+            ? Object.keys(data.features[0].properties)
+            : [],
         });
       } catch (e) {
-        console.log("❌ Failed to load communities:", e);
+        console.error("❌ Failed to load communities:", e);
         setCommunities(null);
       }
     })();
   }, []);
 
-  // Fetch TravelTime isochrone whenever inputs change
+  // Fetch TravelTime isochrone
   const abortRef = useRef<AbortController | null>(null);
   const tRef = useRef<any>(null);
 
@@ -105,7 +105,7 @@ export default function Home() {
       const ac = new AbortController();
       abortRef.current = ac;
 
-      console.log("🕒 ArriveBy ISO being sent:", arriveByISO, "| minutes:", minutes, "| mode:", mode);
+      console.log("🕒 ArriveBy ISO being sent:", arriveByISO);
 
       setLoadingIso(true);
       try {
@@ -122,7 +122,7 @@ export default function Home() {
           }),
         });
 
-        const data = await resp.json();
+        const data = (await resp.json()) as FeatureCollection;
         setIsochrone(data);
       } finally {
         setLoadingIso(false);
@@ -135,26 +135,19 @@ export default function Home() {
     };
   }, [destination, arriveByISO, minutes, mode]);
 
-  // Compute “areas within commute” using centroid-in-polygon (robust MVP)
+  // Compute areas using centroid-in-polygon
   useEffect(() => {
     if (!isochrone || !communities) {
       setWithin([]);
       return;
     }
 
-    const isoFC = isochrone as turf.FeatureCollection;
-    if (!isoFC?.features?.length) {
-      setWithin([]);
-      return;
-    }
+    const combined = turf.combine(isochrone) as FeatureCollection;
+    const isoFeature = combined.features?.[0] as
+      | turf.Feature<Polygon | MultiPolygon>
+      | undefined;
 
-    // Combine all isochrone pieces into one MultiPolygon feature
-    const combinedFC = turf.combine(isoFC) as turf.FeatureCollection;
-    const isoFeature = combinedFC.features?.[0] as turf.Feature<
-      turf.Polygon | turf.MultiPolygon
-    >;
-
-    if (!isoFeature?.geometry) {
+    if (!isoFeature) {
       setWithin([]);
       return;
     }
@@ -168,18 +161,15 @@ export default function Home() {
     });
 
     const hits: CommunityHit[] = [];
-    const commFC = communities as turf.FeatureCollection;
 
-    for (const f of commFC.features || []) {
-      if (!f?.geometry) continue;
+    for (const f of communities.features || []) {
+      if (!f.geometry) continue;
 
-      // Quick bbox prefilter for speed
       const b = turf.bbox(f as any);
       const bboxIntersects =
         !(b[2] < isoBbox[0] || b[0] > isoBbox[2] || b[3] < isoBbox[1] || b[1] > isoBbox[3]);
       if (!bboxIntersects) continue;
 
-      // Robust check: centroid inside isochrone
       let inside = false;
       try {
         const c = turf.centroid(f as any);
@@ -190,11 +180,12 @@ export default function Home() {
 
       if (!inside) continue;
 
-      const name = pickCommunityName((f as any).properties);
-      hits.push({ name, mode: mode.replaceAll("_", " ") });
+      hits.push({
+        name: pickCommunityName(f.properties),
+        mode: mode.replaceAll("_", " "),
+      });
     }
 
-    // De-dupe by name and sort
     const uniq = Array.from(new Map(hits.map((h) => [h.name, h])).values()).sort((a, b) =>
       a.name.localeCompare(b.name)
     );
@@ -202,7 +193,6 @@ export default function Home() {
     setWithin(uniq);
   }, [isochrone, communities, mode]);
 
-  // ✅ UPDATED NSCC coordinates here
   const presets: Dest[] = [
     { name: "NSCC IT Campus", lat: 44.6695774, lng: -63.6147024 },
     { name: "Dalhousie University", lat: 44.6367, lng: -63.5952 },
