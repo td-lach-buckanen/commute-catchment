@@ -3,7 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import MapView from "../components/Map";
 import * as turf from "@turf/turf";
-import type { FeatureCollection, Polygon, MultiPolygon } from "geojson";
+import type {
+  Feature,
+  FeatureCollection,
+  Geometry,
+  Polygon,
+  MultiPolygon,
+} from "geojson";
 
 type Dest = { name: string; lat: number; lng: number };
 
@@ -15,7 +21,6 @@ type CommunityHit = {
 function toArriveByISO(timeHHMM: string) {
   const [hh, mm] = timeHHMM.split(":").map(Number);
 
-  // Next weekday (Mon–Fri)
   const d = new Date();
   while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
 
@@ -25,14 +30,13 @@ function toArriveByISO(timeHHMM: string) {
   const HH = String(hh).padStart(2, "0");
   const Min = String(mm).padStart(2, "0");
 
-  // Halifax = Atlantic Time (UTC-4)
   return `${yyyy}-${MM}-${dd}T${HH}:${Min}:00-04:00`;
 }
 
 function pickCommunityName(props: any): string {
   if (!props || typeof props !== "object") return "Unnamed area";
 
-  const candidates = [
+  const keys = [
     "GSA_NAME",
     "COMMUNITY",
     "COMMUNITY_NAME",
@@ -43,7 +47,7 @@ function pickCommunityName(props: any): string {
     "LABEL",
   ];
 
-  for (const k of candidates) {
+  for (const k of keys) {
     const v = props[k];
     if (typeof v === "string" && v.trim()) return v.trim();
   }
@@ -51,38 +55,58 @@ function pickCommunityName(props: any): string {
   return "Unnamed area";
 }
 
+/**
+ * Extract all Polygon / MultiPolygon features from a FeatureCollection
+ * (avoids GeometryCollection + turf.combine typing issues)
+ */
+function extractIsoPolygons(
+  fc: FeatureCollection
+): Feature<Polygon | MultiPolygon>[] {
+  const out: Feature<Polygon | MultiPolygon>[] = [];
+
+  for (const f of fc.features ?? []) {
+    if (!f.geometry) continue;
+
+    if (f.geometry.type === "Polygon" || f.geometry.type === "MultiPolygon") {
+      out.push(f as Feature<Polygon | MultiPolygon>);
+    }
+  }
+
+  return out;
+}
+
 export default function Home() {
   const [destination, setDestination] = useState<Dest | null>(null);
 
   const [arriveBy, setArriveBy] = useState("08:30");
   const [minutes, setMinutes] = useState(30);
-  const [mode, setMode] = useState<"public_transport" | "driving+public_transport">(
-    "public_transport"
-  );
+  const [mode, setMode] = useState<
+    "public_transport" | "driving+public_transport"
+  >("public_transport");
 
   const [isochrone, setIsochrone] = useState<FeatureCollection | null>(null);
   const [loadingIso, setLoadingIso] = useState(false);
 
-  const [communities, setCommunities] = useState<FeatureCollection | null>(null);
+  const [communities, setCommunities] =
+    useState<FeatureCollection | null>(null);
   const [within, setWithin] = useState<CommunityHit[]>([]);
 
   const arriveByISO = useMemo(() => toArriveByISO(arriveBy), [arriveBy]);
 
-  // Load HRM boundaries once
+  // Load HRM boundaries
   useEffect(() => {
     (async () => {
       try {
-        const r = await fetch("/data/hrm_community_boundaries.geojson", { cache: "no-store" });
+        const r = await fetch("/data/hrm_community_boundaries.geojson", {
+          cache: "no-store",
+        });
         const data = (await r.json()) as FeatureCollection;
         setCommunities(data);
 
         const bbox = turf.bbox(data);
         console.log("🗺️ Communities loaded:", {
           features: data.features?.length ?? 0,
-          bbox: { minLng: bbox[0], minLat: bbox[1], maxLng: bbox[2], maxLat: bbox[3] },
-          sampleProps: data.features?.[0]?.properties
-            ? Object.keys(data.features[0].properties)
-            : [],
+          bbox,
         });
       } catch (e) {
         console.error("❌ Failed to load communities:", e);
@@ -104,8 +128,6 @@ export default function Home() {
       abortRef.current?.abort();
       const ac = new AbortController();
       abortRef.current = ac;
-
-      console.log("🕒 ArriveBy ISO being sent:", arriveByISO);
 
       setLoadingIso(true);
       try {
@@ -135,60 +157,59 @@ export default function Home() {
     };
   }, [destination, arriveByISO, minutes, mode]);
 
-  // Compute areas using centroid-in-polygon
+  // Compute areas within commute
   useEffect(() => {
     if (!isochrone || !communities) {
       setWithin([]);
       return;
     }
 
-    const combined = turf.combine(isochrone) as FeatureCollection;
-    const isoFeature = combined.features?.[0] as
-      | turf.Feature<Polygon | MultiPolygon>
-      | undefined;
-
-    if (!isoFeature) {
+    const isoPolys = extractIsoPolygons(isochrone);
+    if (isoPolys.length === 0) {
       setWithin([]);
       return;
     }
 
-    const isoBbox = turf.bbox(isoFeature);
-    console.log("📐 Isochrone bbox:", {
-      minLng: isoBbox[0],
-      minLat: isoBbox[1],
-      maxLng: isoBbox[2],
-      maxLat: isoBbox[3],
+    const isoBbox = turf.bbox({
+      type: "FeatureCollection",
+      features: isoPolys,
     });
 
     const hits: CommunityHit[] = [];
 
-    for (const f of communities.features || []) {
+    for (const f of communities.features ?? []) {
       if (!f.geometry) continue;
 
-      const b = turf.bbox(f as any);
-      const bboxIntersects =
-        !(b[2] < isoBbox[0] || b[0] > isoBbox[2] || b[3] < isoBbox[1] || b[1] > isoBbox[3]);
-      if (!bboxIntersects) continue;
+      const b = turf.bbox(f as Feature<Geometry>);
+      const intersects =
+        !(b[2] < isoBbox[0] ||
+          b[0] > isoBbox[2] ||
+          b[3] < isoBbox[1] ||
+          b[1] > isoBbox[3]);
 
-      let inside = false;
+      if (!intersects) continue;
+
       try {
-        const c = turf.centroid(f as any);
-        inside = turf.booleanPointInPolygon(c, isoFeature as any);
+        const c = turf.centroid(f as Feature<Geometry>);
+
+        const inside = isoPolys.some((iso) =>
+          turf.booleanPointInPolygon(c, iso)
+        );
+
+        if (!inside) continue;
+
+        hits.push({
+          name: pickCommunityName(f.properties),
+          mode: mode.replaceAll("_", " "),
+        });
       } catch {
-        inside = false;
+        continue;
       }
-
-      if (!inside) continue;
-
-      hits.push({
-        name: pickCommunityName(f.properties),
-        mode: mode.replaceAll("_", " "),
-      });
     }
 
-    const uniq = Array.from(new Map(hits.map((h) => [h.name, h])).values()).sort((a, b) =>
-      a.name.localeCompare(b.name)
-    );
+    const uniq = Array.from(
+      new Map(hits.map((h) => [h.name, h])).values()
+    ).sort((a, b) => a.name.localeCompare(b.name));
 
     setWithin(uniq);
   }, [isochrone, communities, mode]);
@@ -235,12 +256,16 @@ export default function Home() {
               className="mt-1 w-full border rounded px-2 py-1"
             >
               <option value="public_transport">Public transport</option>
-              <option value="driving+public_transport">Drive + public transport</option>
+              <option value="driving+public_transport">
+                Drive + public transport
+              </option>
             </select>
           </div>
 
           <div>
-            <label className="text-sm font-medium">Max commute: {minutes} min</label>
+            <label className="text-sm font-medium">
+              Max commute: {minutes} min
+            </label>
             <input
               type="range"
               min={10}
@@ -280,10 +305,16 @@ export default function Home() {
               ? { lat: destination.lat, lng: destination.lng }
               : { lat: 44.6511, lng: -63.5827 }
           }
-          marker={destination ? { lat: destination.lat, lng: destination.lng } : null}
+          marker={
+            destination ? { lat: destination.lat, lng: destination.lng } : null
+          }
           isochroneGeoJson={isochrone}
           onMapClick={(coords) =>
-            setDestination({ name: "Dropped pin", lat: coords.lat, lng: coords.lng })
+            setDestination({
+              name: "Dropped pin",
+              lat: coords.lat,
+              lng: coords.lng,
+            })
           }
         />
       </div>
